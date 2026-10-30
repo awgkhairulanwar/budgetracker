@@ -428,6 +428,9 @@ function esc(s) {
   return String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
 function parseAmount(v) { return Number(String(v).replace(/,/g, '').trim()); }
+function ymd(d) { return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`; }
+function addDays(s, n) { const [y, m, d] = s.split('-').map(Number); return ymd(new Date(y, m - 1, d + n)); }
+function weekStart() { const d = new Date(); return addDays(todayStr(), -((d.getDay() + 6) % 7)); } // Monday
 function monthsBetween(fromM, toM) {
   const [y1, m1] = fromM.split('-').map(Number); const [y2, m2] = toM.split('-').map(Number);
   return (y2 - y1) * 12 + (m2 - m1) + 1; // inclusive of both months
@@ -477,6 +480,7 @@ function demoApi(action, p) {
       goals: db.Goals.map(g => ({ ...g, saved: r2(saved[g.id] || 0) })),
       transactions: db.Transactions.filter(t => t.date.slice(0, 7) === p.month)
         .sort((a, b) => a.date !== b.date ? (a.date < b.date ? 1 : -1) : (a.createdAt < b.createdAt ? 1 : -1)),
+      recent: p.since ? db.Transactions.filter(t => t.type === 'expense' && t.date >= p.since) : [],
     }));
   }
   const list = db[p.entity];
@@ -503,6 +507,7 @@ function demoApi(action, p) {
 /* ---------------- API ---------------- */
 let inflight = 0;
 async function api(action, payload = {}) {
+  if (action === 'load') payload = { since: weekStart(), ...payload };
   if (DEMO) return demoApi(action, payload);
   inflight++; $('#loading').classList.remove('hidden');
   try {
@@ -563,6 +568,7 @@ async function unlock(pin, remember, silent = false) {
     state.enter = true;
     render();
   } catch (e) {
+    if (state.pin !== pin) return; // a newer unlock attempt has taken over
     state.pin = null;
     if (silent) { $('#lock').classList.remove('hidden'); if (!e.auth) setLockErr(e.message); $('#pinInput').focus(); }
     else setLockErr(e.message);
@@ -584,6 +590,35 @@ function totals() {
   const byCat = {};
   tx.filter(t => t.type === 'expense').forEach(t => { byCat[t.category] = (byCat[t.category] || 0) + t.amount; });
   return { income, spent, saved, balance: income - spent - saved, byCat };
+}
+
+/* ---- Monthly / weekly / daily budgets ---- */
+const PER = { month: { word: 'month', adj: 'Monthly' }, week: { word: 'week', adj: 'Weekly' }, day: { word: 'day', adj: 'Daily' } };
+function perOf(c) { return PER[c.period] ? c.period : 'month'; }
+// What a category's limit adds up to over a whole month (weekly = 7-day rate across the month's days)
+function monthlyBudget(c, m = state.month) {
+  const p = perOf(c), d = daysIn(m);
+  return p === 'day' ? c.budget * d : p === 'week' ? c.budget * d / 7 : c.budget;
+}
+function periodWindow(p) {
+  if (p === 'day') return [todayStr(), todayStr()];
+  const s = weekStart(); return [s, addDays(s, 6)];
+}
+function spentBetween(catIds, from, to) {
+  const pool = new Map();
+  [...(state.data.recent || []), ...state.data.transactions].forEach(t => pool.set(t.id, t));
+  let sum = 0;
+  pool.forEach(t => { if (t.type === 'expense' && catIds.includes(t.category) && t.date >= from && t.date <= to) sum += t.amount; });
+  return sum;
+}
+// Progress against the category's own period while viewing the current month; monthly equivalent otherwise
+function catStatus(c, monthSpent) {
+  const p = perOf(c);
+  if (p !== 'month' && c.budget > 0 && state.month === thisMonth()) {
+    const [f, t] = periodWindow(p);
+    return { used: spentBetween([c.id], f, t), limit: c.budget, p, scope: p === 'day' ? 'today' : 'this week', monthSpent };
+  }
+  return { used: monthSpent, limit: monthlyBudget(c), p: 'month', scope: 'this month', monthSpent };
 }
 
 function billStatus(b) {
@@ -652,9 +687,19 @@ function viewOverview() {
   const expenseCats = state.data.categories.filter(c => c.type === 'expense');
   const rows = expenseCats
     .filter(c => (c.active && c.budget > 0) || t.byCat[c.id])
-    .map(c => ({ c, used: t.byCat[c.id] || 0 }))
-    .sort((a, b) => (b.c.budget ? b.used / b.c.budget : 2) - (a.c.budget ? a.used / a.c.budget : 2));
-  const totalBudget = expenseCats.filter(c => c.active).reduce((a, c) => a + c.budget, 0);
+    .map(c => ({ c, s: catStatus(c, t.byCat[c.id] || 0) }))
+    .sort((a, b) => (b.s.limit ? b.s.used / b.s.limit : 2) - (a.s.limit ? a.s.used / a.s.limit : 2));
+  const totalBudget = expenseCats.filter(c => c.active).reduce((a, c) => a + monthlyBudget(c), 0);
+
+  // "Left today" / "Left this week" for daily and weekly budgets (current month only)
+  const isNow = state.month === thisMonth();
+  const live = p => expenseCats.filter(c => c.active && c.budget > 0 && perOf(c) === p);
+  const leftFor = p => { const cs = live(p); if (!cs.length) return null; const [f, to] = periodWindow(p);
+    const lim = cs.reduce((a, c) => a + c.budget, 0); return { lim, left: lim - spentBetween(cs.map(c => c.id), f, to), n: cs.length }; };
+  const today = isNow ? leftFor('day') : null, week = isNow ? leftFor('week') : null;
+  const liveW = (r, label, key, gold) => `<div class="glass widget ${gold ? 'goldw' : ''}"><span class="label"><i class="dia"></i>${label}</span>
+    <b class="${r.left < 0 ? 'over-text' : ''}" data-count="${r.left}" data-key="${key}">${rm(r.left)}</b>
+    <span class="sub" style="font-size:12.5px;margin-top:6px">of ${rm(r.lim)} · ${r.n} categor${r.n > 1 ? 'ies' : 'y'}</span></div>`;
 
   const bills = state.data.recurring.filter(b => b.active);
   const unpaid = bills.filter(b => billStatus(b).key !== 'paid');
@@ -673,6 +718,10 @@ function viewOverview() {
       <div class="glass widget"><span class="label"><i class="dia"></i>Spent</span><b data-count="${t.spent}" data-key="spt">${rm(t.spent)}</b></div>
       <div class="glass widget"><span class="label"><i class="dia"></i>Saved</span><b data-count="${t.saved}" data-key="svd">${rm(t.saved)}</b></div>
     </div>`;
+  if (today || week) {
+    html += `<div class="stats" style="grid-template-columns:repeat(${today && week ? 2 : 1},1fr)">
+      ${today ? liveW(today, 'Left today', 'ltd', true) : ''}${week ? liveW(week, 'Left this week', 'lwk', !today) : ''}</div>`;
+  }
 
   if (bills.length) {
     html += `<button class="glass card card-row lift" data-go="bills">
@@ -692,13 +741,17 @@ function viewOverview() {
   if (!rows.length) {
     html += emptyHtml(I.sliders, 'No budgets set yet. Open <b>Budget</b> and give each category a monthly limit.');
   } else {
-    html += `<ul class="glass group plain">` + rows.map(({ c, used }) => {
-      const left = c.budget - used;
-      const sub = c.budget > 0
-        ? (left >= 0 ? `${rm(left)} left of ${rm(c.budget)}` : `<span class="over-text">${rm(-left)} over</span> · budget ${rm(c.budget)}`)
+    html += `<ul class="glass group plain">` + rows.map(({ c, s }) => {
+      const left = s.limit - s.used;
+      const per = perOf(c);
+      const limTxt = per === 'month' ? rm(s.limit) : s.p === 'month' ? `${rm(s.limit)} (${rm(c.budget)}/${PER[per].word})` : `${rm(c.budget)}/${PER[per].word}`;
+      let sub = c.budget > 0
+        ? (left >= 0 ? `${rm(left)} left ${s.p === 'month' ? 'of' : s.scope + ' ·'} ${limTxt}` : `<span class="over-text">${rm(-left)} over ${s.p === 'month' ? '' : s.scope}</span> · ${limTxt}`)
         : 'No budget set';
-      return `<li class="cat-row"><div class="top"><strong>${esc(c.name)}</strong><span class="amt">${rm(used)}</span></div>
-        <span class="sub">${sub}</span>${barHtml(used, c.budget)}</li>`;
+      if (s.p !== 'month') sub += ` · ${rm(s.monthSpent)} this month`;
+      const tag = per !== 'month' && c.budget > 0 ? ` <span class="pill due" style="height:20px;font-size:11px;padding:0 8px;vertical-align:2px">${PER[per].adj}</span>` : '';
+      return `<li class="cat-row"><div class="top"><strong>${esc(c.name)}${tag}</strong><span class="amt">${rm(s.used)}</span></div>
+        <span class="sub">${sub}</span>${barHtml(s.used, s.limit)}</li>`;
     }).join('') + `</ul>`;
   }
   return html;
@@ -808,16 +861,17 @@ function viewSettings() {
   const exp = state.data.categories.filter(c => c.type === 'expense' && c.active);
   const inc = state.data.categories.filter(c => c.type === 'income' && c.active);
   const archived = state.data.categories.filter(c => !c.active);
-  const totalBudget = exp.reduce((a, c) => a + c.budget, 0);
+  const totalBudget = exp.reduce((a, c) => a + monthlyBudget(c), 0);
+  const hasShort = exp.some(c => c.budget > 0 && perOf(c) !== 'month');
   const catRow = c => `<li><button class="row-btn" data-edit-cat="${esc(c.id)}">
     <span class="row-main"><strong>${esc(c.name)}</strong></span>
-    ${c.type === 'expense' ? (c.budget ? `<span class="amt trail">${rm(c.budget)}</span>` : '<span class="amt muted">Set budget</span>') : ''}${I.chev}</button></li>`;
+    ${c.type === 'expense' ? (c.budget ? `<span class="amt trail">${rm(c.budget)}<span style="color:var(--text-3);font-weight:500"> / ${PER[perOf(c)].word}</span></span>` : '<span class="amt muted">Set budget</span>') : ''}${I.chev}</button></li>`;
 
   return `
     <section class="glass hero"><i class="tab-tl"></i><i class="tab-br"></i>
       <span class="label"><i class="dia"></i>Monthly budget</span>
       <b class="hero-num mg" data-count="${totalBudget}" data-key="tb">${rm(totalBudget)}</b>
-      <p class="hero-sub">${t.income ? `${Math.round((totalBudget / t.income) * 100)}% of this month's income (${rm(t.income)}).` : 'Limits apply to every month.'}</p></section>
+      <p class="hero-sub">${t.income ? `${Math.round((totalBudget / t.income) * 100)}% of this month's income (${rm(t.income)}).` : 'Limits apply to every month.'}${hasShort ? ` Weekly and daily limits are counted across the ${daysIn(state.month)} days of ${monthName(state.month).split(' ')[0]}.` : ''}</p></section>
     <div><div class="group-h">Spending categories</div><ul class="glass group plain">${exp.map(catRow).join('')}</ul></div>
     <div><div class="group-h">Income categories</div><ul class="glass group plain">${inc.map(catRow).join('')}</ul></div>
     <button class="btn glassb" data-new-cat>Add a category</button>
@@ -940,18 +994,32 @@ function catForm(existing = {}) {
   const form = openSheet(editing ? 'Edit category' : 'New category', `
     ${editing ? '' : segHtml('catSeg', [['expense', 'Spending'], ['income', 'Income']], 'expense')}
     <div class="field"><label for="c_name">Name</label><input id="c_name" maxlength="40" value="${esc(c.name)}" ${editing ? '' : 'autofocus'}></div>
-    <div class="field" id="budgetField"><label for="c_budget">Monthly budget</label>
-      <div class="amount-wrap"><span>RM</span><input id="c_budget" class="amount-input" inputmode="decimal" placeholder="0.00" value="${c.budget || ''}" ${editing ? 'autofocus' : ''}></div></div>
+    <div id="budgetField">
+      <div class="field" style="margin-bottom:8px"><label>Budget period</label></div>
+      ${segHtml('perSeg', [['month', 'Monthly'], ['week', 'Weekly'], ['day', 'Daily']], perOf(c))}
+      <div class="field"><label for="c_budget" id="budgetLabel">Budget per month</label>
+        <div class="amount-wrap"><span>RM</span><input id="c_budget" class="amount-input" inputmode="decimal" placeholder="0.00" value="${c.budget || ''}" ${editing ? 'autofocus' : ''}></div>
+        <span class="sub" id="perHint" style="margin:8px 4px 0;min-height:19px"></span></div>
+    </div>
     <div class="actions">
       <button class="btn gold" type="submit">Save</button>
       ${editing ? `<button class="btn danger" type="button" id="archCat">${c.active ? 'Archive category' : 'Restore category'}</button>` : ''}
     </div>`);
-  let type = c.type;
+  let type = c.type, period = perOf(c);
   const syncBudget = () => $('#budgetField').classList.toggle('hidden', type !== 'expense');
-  syncBudget();
+  const syncHint = () => {
+    $('#budgetLabel').textContent = `Budget per ${PER[period].word}`;
+    const v = parseAmount($('#c_budget').value) || 0, d = daysIn(state.month);
+    $('#perHint').textContent = v > 0 && period !== 'month'
+      ? `About ${rm(monthlyBudget({ budget: v, period }))} over ${monthName(state.month).split(' ')[0]} (${d} days)`
+      : period === 'week' ? 'Weeks run Monday to Sunday.' : '';
+  };
+  syncBudget(); syncHint();
   $$('#catSeg button').forEach(b => b.onclick = () => { type = b.dataset.type; $$('#catSeg button').forEach(x => x.classList.toggle('on', x === b)); syncSeg($('#catSeg')); syncBudget(); });
+  $$('#perSeg button').forEach(b => b.onclick = () => { period = b.dataset.type; $$('#perSeg button').forEach(x => x.classList.toggle('on', x === b)); syncSeg($('#perSeg')); syncHint(); });
+  $('#c_budget').addEventListener('input', syncHint);
 
-  const record = active => ({ id: existing.id, name: $('#c_name').value, type, budget: type === 'expense' ? (parseAmount($('#c_budget').value) || 0) : 0, active });
+  const record = active => ({ id: existing.id, name: $('#c_name').value, type, budget: type === 'expense' ? (parseAmount($('#c_budget').value) || 0) : 0, period: type === 'expense' ? period : 'month', active });
   form.onsubmit = e => { e.preventDefault(); submit(form, () => api('save', { entity: 'Categories', record: record(c.active) })); };
   if (editing) $('#archCat').onclick = () => submit(form, () => api('save', { entity: 'Categories', record: record(!c.active) }), c.active ? 'Archived' : 'Restored');
 }
